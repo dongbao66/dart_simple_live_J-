@@ -1,0 +1,120 @@
+name: build-all
+
+# 不再自己编译，改为收集上游 app-build-action-dev 的产物并发布 nightly。
+# 这样 Flutter 版本、依赖、签名等改动都跟着上游走，不用手工跟版。
+on:
+  workflow_run:
+    workflows: ["app-build-action-dev"]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: "要收集产物的 app-build-action-dev 运行 ID（留空则取最近一次成功运行）"
+        required: false
+        default: ""
+
+permissions:
+  contents: write   # 发布/更新 Release
+  actions: read     # 跨工作流下载产物
+
+jobs:
+  publish:
+    name: Publish to nightly Release
+    runs-on: ubuntu-24.04
+    # 上游构建失败时不再发一个「看起来成功」的空 nightly
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    steps:
+      - name: Resolve run id
+        id: run
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_RUN_ID: ${{ inputs.run_id }}
+          EVENT_RUN_ID: ${{ github.event.workflow_run.id }}
+        run: |
+          set -euo pipefail
+          if [ -n "$INPUT_RUN_ID" ]; then
+            RUN_ID="$INPUT_RUN_ID"
+          elif [ -n "$EVENT_RUN_ID" ]; then
+            RUN_ID="$EVENT_RUN_ID"
+          else
+            RUN_ID=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow publish_app_dev.yaml --status success --limit 1 \
+              --json databaseId --jq '.[0].databaseId')
+          fi
+          if [ -z "$RUN_ID" ]; then
+            echo "::error::未能确定要收集产物的运行 ID"
+            exit 1
+          fi
+          echo "run_id=$RUN_ID" >> "$GITHUB_OUTPUT"
+          echo "将收集运行 $RUN_ID 的产物。"
+
+      - name: Download upstream artifacts
+        uses: actions/download-artifact@v5
+        with:
+          github-token: ${{ github.token }}
+          run-id: ${{ steps.run.outputs.run_id }}
+          path: artifacts
+
+      - name: Prepare files
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          # 上游 artifact 名：android / ios / mac / linux / windows
+          find artifacts -type f \( -name '*.apk' -o -name '*.ipa' -o -name '*.zip' \
+            -o -name '*.deb' -o -name '*.dmg' -o -name '*.msix' \) -exec cp {} out/ \;
+          # 显式校验：产物为空就让流程红掉，而不是发一个空 Release
+          COUNT=$(find out -type f | wc -l)
+          echo "收集到 $COUNT 个文件："
+          ls -la out/
+          if [ "$COUNT" -eq 0 ]; then
+            echo "::error::未收集到任何构建产物，检查上游运行 ${{ steps.run.outputs.run_id }} 勾选了哪些平台"
+            exit 1
+          fi
+
+      - name: Clean stale nightly assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # 只清理「本次构建涉及的同类文件」，不清空整个 Release。
+          # 原因：Windows/Linux/macOS 包名带版本号，版本号一变旧包就会残留越积越多；
+          # 但若默认只构建 iOS 就清空全部资产，会把之前发的 Android/Windows 包一起删掉。
+          EXTS=$(find out -type f -printf '%f\n' | sed 's/.*\.//' | sort -u | tr '\n' '|' | sed 's/|$//')
+          if [ -z "$EXTS" ]; then
+            echo "本次无产物，跳过清理。"
+          elif gh release view nightly --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name' > /tmp/old_assets.txt 2>/dev/null; then
+            echo "本次涉及的扩展名：$EXTS"
+            while IFS= read -r name; do
+              [ -z "$name" ] && continue
+              if echo "$name" | grep -Eq "\.($EXTS)$"; then
+                echo "删除同类旧资产：$name"
+                gh release delete-asset nightly "$name" --repo "$GITHUB_REPOSITORY" --yes || true
+              else
+                echo "保留其他平台资产：$name"
+              fi
+            done < /tmp/old_assets.txt
+          else
+            echo "nightly Release 尚不存在，跳过清理。"
+          fi
+
+      - name: Publish/Update nightly release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: nightly
+          name: Nightly Build
+          prerelease: true
+          generate_release_notes: false
+          fail_on_unmatched_files: true
+          files: |
+            out/*
+          body: |
+            自动同步 June6699/master 后由上游 app-build-action-dev 构建。
+
+            - Android APK：debug 签名兜底（未配置 release keystore），可与官方版共存但无法覆盖安装
+            - iOS：未签名 IPA，需自行重签后安装
+            - Windows / Linux / macOS：取决于本次派发勾选的平台
+
+            构建来源运行：#${{ steps.run.outputs.run_id }}
+
+      - name: Summary
+        run: |
+          echo "nightly Release 已更新，共 $(find out -type f | wc -l) 个文件。"
