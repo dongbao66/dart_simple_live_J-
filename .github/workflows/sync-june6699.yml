@@ -1,0 +1,155 @@
+name: sync-june6699
+
+on:
+  workflow_dispatch:
+    inputs:
+      force_build:
+        description: "上游无更新时也强制触发一次构建"
+        type: boolean
+        default: false
+      build_android:
+        description: "构建 Android APK（默认关闭）"
+        type: boolean
+        default: false
+      build_ios:
+        description: "构建 iOS 未签名 IPA（默认开启）"
+        type: boolean
+        default: true
+      build_windows:
+        description: "构建 Windows 包（默认关闭）"
+        type: boolean
+        default: false
+      build_linux:
+        description: "构建 Linux 包（deb/zip，默认关闭）"
+        type: boolean
+        default: false
+      build_macos:
+        description: "构建 macOS 包（dmg/zip，默认关闭；iOS 与 macOS 均走 macOS runner，计费倍率高）"
+        type: boolean
+        default: false
+  schedule:
+    # UTC 00:23，避开整点调度高峰导致的排队与丢任务；北京时间 08:23
+    - cron: '23 0 * * *'
+
+jobs:
+  sync:
+    name: Sync upstream
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write   # reset + force push master
+      actions: write    # 触发上游 publish_app_dev.yaml
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: master
+          fetch-depth: 0
+
+      - name: Config git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Backup custom workflows
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/custom_workflows
+          # 只备份本仓库自定义的两个文件，缺失即报错，避免静默丢失
+          for f in sync-june6699.yml build-all.yml; do
+            if [ ! -f ".github/workflows/$f" ]; then
+              echo "::error::缺少自定义工作流文件 .github/workflows/$f"
+              exit 1
+            fi
+            cp ".github/workflows/$f" /tmp/custom_workflows/
+          done
+          ls -la /tmp/custom_workflows/
+
+      - name: Fetch upstream
+        run: |
+          set -euo pipefail
+          UPSTREAM_URL="https://github.com/June6699/dart_simple_live.git"
+          if git remote get-url upstream >/dev/null 2>&1; then
+            git remote set-url upstream "$UPSTREAM_URL"
+          else
+            git remote add upstream "$UPSTREAM_URL"
+          fi
+          git fetch upstream master
+
+      - name: Reset master to upstream/master
+        run: |
+          set -euo pipefail
+          git checkout master
+          git reset --hard upstream/master
+
+      - name: Detect upstream change
+        id: change
+        run: |
+          set -euo pipefail
+          NEW_SHA=$(git rev-parse upstream/master)
+
+          # 注意不能用「文件树是否相等」判断：origin/master 里多了两个自定义
+          # workflow 文件，树永远和纯上游不一样，会导致每天都空推送一次。
+          # 正确做法是看祖先关系：
+          #   若 upstream/master 已经是 origin/master 的祖先，说明上次同步已经
+          #   包含了当前上游提交，本次无更新；否则上游有新提交，需要同步。
+          if git fetch origin master >/dev/null 2>&1 && git rev-parse --verify FETCH_HEAD >/dev/null 2>&1; then
+            OLD_SHA=$(git rev-parse FETCH_HEAD)
+            if git merge-base --is-ancestor "$NEW_SHA" FETCH_HEAD; then
+              echo "changed=false" >> "$GITHUB_OUTPUT"
+              echo "upstream_sha=$NEW_SHA" >> "$GITHUB_OUTPUT"
+              echo "origin_sha=$OLD_SHA" >> "$GITHUB_OUTPUT"
+              echo "上游无新提交（$NEW_SHA 已在 origin/master 历史中），跳过推送与构建。"
+            else
+              echo "changed=true" >> "$GITHUB_OUTPUT"
+              echo "upstream_sha=$NEW_SHA" >> "$GITHUB_OUTPUT"
+              echo "origin_sha=$OLD_SHA" >> "$GITHUB_OUTPUT"
+              echo "检测到上游更新：origin=$OLD_SHA -> upstream=$NEW_SHA"
+            fi
+          else
+            # origin/master 不存在或历史不相关（首次运行、仓库刚建），按有更新处理
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "upstream_sha=$NEW_SHA" >> "$GITHUB_OUTPUT"
+            echo "origin_sha=none" >> "$GITHUB_OUTPUT"
+            echo "未取到 origin/master，按首次同步处理。"
+          fi
+
+      - name: Restore custom workflows and push
+        if: steps.change.outputs.changed == 'true'
+        run: |
+          set -euo pipefail
+          mkdir -p .github/workflows
+          cp -a /tmp/custom_workflows/. .github/workflows/
+          git add .github/workflows/
+          SHORT=$(git rev-parse --short upstream/master)
+          git commit -m "chore: restore custom workflows after sync to $SHORT"
+          # force-with-lease：若期间有人往 master 推了新提交，推送会被拒绝而不是覆盖掉
+          git push --force-with-lease origin master
+
+      - name: Trigger upstream dev build
+        if: steps.change.outputs.changed == 'true' || inputs.force_build == true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # schedule 触发时 inputs 为空，用表达式侧 || 兜底；
+          # 兜底值必须与上方 workflow_dispatch.inputs.*.default 保持一致，
+          # 否则定时构建的平台会和手动触发的默认勾选不一致。
+          ANDROID: ${{ inputs.build_android || false }}
+          IOS: ${{ inputs.build_ios || true }}
+          WINDOWS: ${{ inputs.build_windows || false }}
+          LINUX: ${{ inputs.build_linux || false }}
+          MACOS: ${{ inputs.build_macos || false }}
+        run: |
+          set -euo pipefail
+
+          # gh 客户端把 --json 内容解析为 map[string]string，值必须是字符串；
+          # 布尔转换由 GitHub 服务端按上游声明的 type: boolean 完成。
+          printf '{"build_android":"%s","build_ios":"%s","build_windows":"%s","build_linux":"%s","build_macos":"%s"}\n' \
+            "$ANDROID" "$IOS" "$WINDOWS" "$LINUX" "$MACOS" > /tmp/dispatch.json
+          echo "派发参数：$(cat /tmp/dispatch.json)"
+
+          # 必须显式 --repo：仓库里同时存在 origin（本仓库）和 upstream（June6699）
+          # 两个远端，gh 可能把目标解析成 upstream，令牌在上游无权限会 403。
+          gh workflow run publish_app_dev.yaml --repo "$GITHUB_REPOSITORY" --ref master --json < /tmp/dispatch.json
+          echo "已触发上游 app-build-action-dev，产物由 build-all.yml 收集发布到 nightly Release。"
+
+      - name: Complete
+        run: |
+          echo "同步结束。changed=${{ steps.change.outputs.changed }}"

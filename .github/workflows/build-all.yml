@@ -1,0 +1,156 @@
+name: build-all
+
+# 不再自己编译，改为收集上游 app-build-action-dev 的产物并发布 nightly。
+# 三重触发兜底：
+#  1) workflow_run：上游构建完成时立即接力（本仓库实测该触发器曾不生效，不能作唯一保障）
+#  2) schedule：每小时兜底巡检一次；已发布过则靠「来源运行 ID」幂等跳过，几乎零成本
+#  3) workflow_dispatch：手动补发，可用 run_id 指定任意一次上游成功运行
+on:
+  workflow_run:
+    workflows: ["app-build-action-dev"]
+    types: [completed]
+  schedule:
+    # 每小时第 47 分钟，避开整点调度高峰
+    - cron: '47 * * * *'
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: "要收集产物的 app-build-action-dev 运行 ID（留空则取最近一次成功运行）"
+        required: false
+        default: ""
+
+permissions:
+  contents: write   # 发布/更新 Release
+  actions: read     # 跨工作流读取运行与产物
+
+jobs:
+  publish:
+    name: Publish to nightly Release
+    runs-on: ubuntu-24.04
+    # workflow_run 路径要求上游成功才发布；schedule / 手动路径交给后续步骤自行判断
+    if: ${{ github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success' }}
+    steps:
+      - name: Resolve run id
+        id: run
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_RUN_ID: ${{ inputs.run_id }}
+          EVENT_RUN_ID: ${{ github.event.workflow_run.id }}
+        run: |
+          set -euo pipefail
+          if [ -n "$INPUT_RUN_ID" ]; then
+            RUN_ID="$INPUT_RUN_ID"
+          elif [ -n "$EVENT_RUN_ID" ]; then
+            RUN_ID="$EVENT_RUN_ID"
+          else
+            RUN_ID=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow publish_app_dev.yaml \
+              --status success --limit 1 --json databaseId --jq '.[0].databaseId' || true)
+            # 空数组时 jq 会输出字符串 null，归一为空
+            if [ "$RUN_ID" = "null" ]; then RUN_ID=""; fi
+          fi
+          echo "run_id=${RUN_ID}" >> "$GITHUB_OUTPUT"
+          if [ -z "$RUN_ID" ]; then
+            echo "暂无成功的上游构建，本次跳过。"
+          else
+            echo "将收集运行 $RUN_ID 的产物。"
+          fi
+
+      - name: Gate (skip when nothing to do)
+        id: gate
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          RUN_ID="${{ steps.run.outputs.run_id }}"
+          if [ -z "$RUN_ID" ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "没有可收集的运行，跳过发布。"
+            exit 0
+          fi
+          # 幂等：nightly 正文里已记录同一个来源运行 ID 时不再重复发布
+          BODY=$(gh release view nightly --repo "$GITHUB_REPOSITORY" --json body --jq '.body' 2>/dev/null || true)
+          if echo "$BODY" | grep -qE "构建来源运行：#${RUN_ID}$"; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "nightly 已来自运行 #${RUN_ID}，跳过本次发布。"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            echo "nightly 需要更新到运行 #${RUN_ID}。"
+          fi
+
+      - name: Download upstream artifacts
+        if: steps.gate.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          # 用 gh CLI 跨运行下载，比 download-artifact 的跨运行参数更稳
+          gh run download "${{ steps.run.outputs.run_id }}" --repo "$GITHUB_REPOSITORY" -D artifacts
+
+      - name: Prepare files
+        if: steps.gate.outputs.skip != 'true'
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          # 上游 artifact 名：android / ios / mac / linux / windows，下载后按名分目录
+          find artifacts -type f \( -name '*.apk' -o -name '*.ipa' -o -name '*.zip' \
+            -o -name '*.deb' -o -name '*.dmg' -o -name '*.msix' \) -exec cp {} out/ \;
+          # 显式校验：产物为空就让流程红掉，而不是发一个空 Release
+          COUNT=$(find out -type f | wc -l)
+          echo "收集到 $COUNT 个文件："
+          ls -la out/
+          if [ "$COUNT" -eq 0 ]; then
+            echo "::error::未收集到任何构建产物，检查上游运行 ${{ steps.run.outputs.run_id }} 勾选了哪些平台"
+            exit 1
+          fi
+
+      - name: Clean stale nightly assets
+        if: steps.gate.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # 只清理「本次构建涉及的同类文件」，不清空整个 Release。
+          # 原因：Windows/Linux/macOS 包名带版本号，版本号一变旧包就会残留越积越多；
+          # 但只构建 iOS 时若清空全部资产，会把之前发的 Android/Windows 包一起删掉。
+          EXTS=$(find out -type f -printf '%f\n' | sed 's/.*\.//' | sort -u | tr '\n' '|' | sed 's/|$//')
+          if [ -z "$EXTS" ]; then
+            echo "本次无产物，跳过清理。"
+          elif gh release view nightly --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name' > /tmp/old_assets.txt 2>/dev/null; then
+            echo "本次涉及的扩展名：$EXTS"
+            while IFS= read -r name; do
+              [ -z "$name" ] && continue
+              if echo "$name" | grep -Eq "\.($EXTS)$"; then
+                echo "删除同类旧资产：$name"
+                gh release delete-asset nightly "$name" --repo "$GITHUB_REPOSITORY" --yes || true
+              else
+                echo "保留其他平台资产：$name"
+              fi
+            done < /tmp/old_assets.txt
+          else
+            echo "nightly Release 尚不存在，跳过清理。"
+          fi
+
+      - name: Publish/Update nightly release
+        if: steps.gate.outputs.skip != 'true'
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: nightly
+          name: Nightly Build
+          prerelease: true
+          generate_release_notes: false
+          fail_on_unmatched_files: true
+          files: |
+            out/*
+          body: |
+            自动同步 June6699/master 后由上游 app-build-action-dev 构建，仅包含本次勾选的平台。
+
+            - iOS：未签名 IPA，需自行重签后安装
+            - Android / Windows / Linux / macOS：取决于本次派发勾选的平台
+
+            构建来源运行：#${{ steps.run.outputs.run_id }}
+
+      - name: Summary
+        if: steps.gate.outputs.skip != 'true'
+        run: |
+          echo "nightly Release 已更新，共 $(find out -type f | wc -l) 个文件。"
