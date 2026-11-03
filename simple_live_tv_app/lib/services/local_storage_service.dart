@@ -122,12 +122,21 @@ class LocalStorageService extends GetxService {
   /// 遥控器OK键行为：0=显示/隐藏控制栏（默认） 1=暂停/继续
   static const String kOkKeyAction = "OkKeyAction";
 
+  /// 全屏四角时钟：开关与位置（0=左上 1=右上 2=左下 3=右下，默认右上）
+  static const String kPlayerClockEnable = "PlayerClockEnable";
+  static const String kPlayerClockPosition = "PlayerClockPosition";
+
   /// 播放器缓冲区大小
   static const String kPlayerBufferSize = "PlayerBufferSize";
   static const String kPlayerForceHttps = "PlayerForceHttps";
   static const String kAutoSwitchNextOnLiveEnd = "AutoSwitchNextOnLiveEnd";
   static const String kAutoSwitchNextOnPlaybackFailure =
       "AutoSwitchNextOnPlaybackFailure";
+
+  /// 自动换台轮播列表：开关、顺序模式（0=顺序 1=随机）与成员快照
+  static const String kAutoSwitchListEnabled = "AutoSwitchListEnabled";
+  static const String kAutoSwitchListMode = "AutoSwitchListMode";
+  static const String kAutoSwitchListItems = "AutoSwitchListItems";
   static const String kPlayerVolume = "PlayerVolume";
   static const String kLogEnable = "LogEnable";
   static const String kMpvProfile = "MpvProfile";

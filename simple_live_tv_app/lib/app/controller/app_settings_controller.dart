@@ -171,6 +171,15 @@ class AppSettingsController extends GetxController {
     okKeyAction.value = LocalStorageService.instance
         .getValue(LocalStorageService.kOkKeyAction, kOkKeyActionShowControls);
 
+    playerClockEnable.value = LocalStorageService.instance
+        .getValue(LocalStorageService.kPlayerClockEnable, false);
+    playerClockPosition.value = _normalizePlayerClockPosition(
+      LocalStorageService.instance.getValue(
+        LocalStorageService.kPlayerClockPosition,
+        kPlayerClockPositionTopRight,
+      ),
+    );
+
     autoFullScreen.value = LocalStorageService.instance
         .getValue(LocalStorageService.kAutoFullScreen, false);
     autoSwitchNextOnLiveEnd.value = LocalStorageService.instance.getValue(
@@ -182,6 +191,16 @@ class AppSettingsController extends GetxController {
       LocalStorageService.kAutoSwitchNextOnPlaybackFailure,
       false,
     );
+    autoSwitchListEnabled.value = LocalStorageService.instance.getValue(
+      LocalStorageService.kAutoSwitchListEnabled,
+      false,
+    );
+    autoSwitchListMode.value = LocalStorageService.instance.getValue(
+      LocalStorageService.kAutoSwitchListMode,
+      0,
+    ) == 1
+        ? 1
+        : 0;
 
     shieldList
       ..clear()
@@ -572,6 +591,36 @@ class AppSettingsController extends GetxController {
 
   bool get okKeyTriggersPlayPause => okKeyAction.value == kOkKeyActionPlayPause;
 
+  /// 全屏四角时钟：0=左上 1=右上（默认） 2=左下 3=右下
+  static const int kPlayerClockPositionTopLeft = 0;
+  static const int kPlayerClockPositionTopRight = 1;
+  static const int kPlayerClockPositionBottomLeft = 2;
+  static const int kPlayerClockPositionBottomRight = 3;
+
+  var playerClockEnable = false.obs;
+  void setPlayerClockEnable(bool e) {
+    playerClockEnable.value = e;
+    LocalStorageService.instance
+        .setValue(LocalStorageService.kPlayerClockEnable, e);
+  }
+
+  var playerClockPosition = kPlayerClockPositionTopRight.obs;
+  void setPlayerClockPosition(int e) {
+    playerClockPosition.value = _normalizePlayerClockPosition(e);
+    LocalStorageService.instance
+        .setValue(LocalStorageService.kPlayerClockPosition, e);
+  }
+
+  static int _normalizePlayerClockPosition(int e) {
+    const valid = [
+      kPlayerClockPositionTopLeft,
+      kPlayerClockPositionTopRight,
+      kPlayerClockPositionBottomLeft,
+      kPlayerClockPositionBottomRight,
+    ];
+    return valid.contains(e) ? e : kPlayerClockPositionTopRight;
+  }
+
   var autoFullScreen = false.obs;
   void setAutoFullScreen(bool e) {
     autoFullScreen.value = e;
@@ -594,6 +643,26 @@ class AppSettingsController extends GetxController {
     LocalStorageService.instance.setValue(
       LocalStorageService.kAutoSwitchNextOnPlaybackFailure,
       e,
+    );
+  }
+
+  /// 自动换台候选源使用轮播列表（#154）
+  var autoSwitchListEnabled = false.obs;
+  void setAutoSwitchListEnabled(bool e) {
+    autoSwitchListEnabled.value = e;
+    LocalStorageService.instance.setValue(
+      LocalStorageService.kAutoSwitchListEnabled,
+      e,
+    );
+  }
+
+  /// 轮播点名顺序：0=顺序（从当前成员环形顺延） 1=随机
+  var autoSwitchListMode = 0.obs;
+  void setAutoSwitchListMode(int e) {
+    autoSwitchListMode.value = e == 1 ? 1 : 0;
+    LocalStorageService.instance.setValue(
+      LocalStorageService.kAutoSwitchListMode,
+      autoSwitchListMode.value,
     );
   }
 
