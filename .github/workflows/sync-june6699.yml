@@ -16,9 +16,9 @@ on:
         type: boolean
         default: true
       build_windows:
-        description: "构建 Windows 包（默认关闭）"
+        description: "构建 Windows 包（默认开启）"
         type: boolean
-        default: false
+        default: true
       build_linux:
         description: "构建 Linux 包（deb/zip，默认关闭）"
         type: boolean
@@ -147,7 +147,7 @@ jobs:
           # 否则定时构建的平台会和手动触发的默认勾选不一致。
           ANDROID: ${{ inputs.build_android || false }}
           IOS: ${{ inputs.build_ios || true }}
-          WINDOWS: ${{ inputs.build_windows || false }}
+          WINDOWS: ${{ inputs.build_windows || true }}
           LINUX: ${{ inputs.build_linux || false }}
           MACOS: ${{ inputs.build_macos || false }}
         run: |
