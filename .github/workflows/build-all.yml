@@ -1,0 +1,340 @@
+name: build-all
+
+# 不再自己编译，改为收集上游 app-build-action-dev 的产物并发布 nightly。
+# 注意：上游多平台是并行 job 但整体只有一个结论，单个平台失败会让整次运行
+# conclusion=failure。这里不以整体结论为准，而是「有产物就收」，
+# 避免 Windows 挂掉连带把已构建成功的 IPA 一起丢弃。
+# 三重触发兜底：
+#  1) workflow_run：上游构建完成时立即接力（本仓库实测该触发器曾不生效，不能作唯一保障）
+#  2) schedule：每小时兜底巡检一次；已发布过则靠「来源运行 ID」幂等跳过，几乎零成本
+#  3) workflow_dispatch：手动补发，可用 run_id 指定任意一次上游运行
+on:
+  workflow_run:
+    workflows: ["app-build-action-dev"]
+    types: [completed]
+  schedule:
+    # 每小时第 47 分钟，避开整点调度高峰
+    - cron: '47 * * * *'
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: "要收集产物的 app-build-action-dev 运行 ID（留空则取最近一次有产物的已完成运行）"
+        required: false
+        default: ""
+
+permissions:
+  contents: write   # 发布/更新 Release
+  actions: write    # 跨工作流读取运行与产物；runner 获取失败时重跑失败 job
+
+jobs:
+  publish:
+    name: Publish to nightly Release
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Auto-retry runner acquisition failures
+        id: retry
+        if: github.event_name != 'workflow_dispatch'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # macOS runner 容量紧张时，job 会排队十几分钟仍拿不到 runner，
+          # 表现为 conclusion=failure/cancelled 且 steps 为空（如 run #6 的 build-ios）。
+          # 这是 GitHub 基础设施问题，不是编译错误，重跑一次往往就能过。
+          # 只重试这种「空 steps」失败；真正编译失败（steps 非空）不重试。
+          RID="${{ github.event.workflow_run.id }}"
+          if [ -z "$RID" ]; then
+            RID=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow publish_app_dev.yaml \
+              --limit 1 --json databaseId --jq '.[0].databaseId' 2>/dev/null || echo "")
+          fi
+          if [ -z "$RID" ] || [ "$RID" = "null" ]; then
+            echo "无可检查的上游运行。"
+            exit 0
+          fi
+          ATTEMPT=$(gh run view "$RID" --repo "$GITHUB_REPOSITORY" \
+            --json attempt --jq '.attempt' 2>/dev/null || echo 0)
+          if [ "${ATTEMPT:-0}" -ge 2 ]; then
+            echo "运行 $RID 已是第 $ATTEMPT 次尝试，不再自动重试。"
+            exit 0
+          fi
+          INFRA=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$RID/jobs?per_page=50" \
+            --jq '[.jobs[] | select((.conclusion == "failure" or .conclusion == "cancelled") and ((.steps // []) | length == 0))] | length' \
+            2>/dev/null || echo 0)
+          case "$INFRA" in ''|*[!0-9]*) INFRA=0 ;; esac
+          if [ "$INFRA" -gt 0 ]; then
+            echo "运行 $RID 有 $INFRA 个 job 因拿不到 runner 失败，自动重跑失败 job。"
+            gh run rerun "$RID" --failed --repo "$GITHUB_REPOSITORY" || echo "::warning::自动重跑请求失败，可手动 Re-run failed jobs。"
+            echo "retried=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "运行 $RID 无需自动重试。"
+          fi
+
+      - name: Resolve run id
+        id: run
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_RUN_ID: ${{ inputs.run_id }}
+          EVENT_RUN_ID: ${{ github.event.workflow_run.id }}
+        run: |
+          set -euo pipefail
+
+          # 统计某次运行「未过期产物」的数量；查询失败一律当 0，不让流程中断
+          artifact_count() {
+            local n
+            n=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$1/artifacts" \
+                  --jq '[.artifacts[] | select(.expired == false)] | length' 2>/dev/null || echo 0)
+            case "$n" in ''|*[!0-9]*) n=0 ;; esac
+            echo "$n"
+          }
+
+          if [ -n "$INPUT_RUN_ID" ]; then
+            RUN_ID="$INPUT_RUN_ID"
+          elif [ -n "$EVENT_RUN_ID" ]; then
+            # workflow_run 触发：上游已结束，成败都尝试收集，收不到由后面的校验拦下
+            RUN_ID="$EVENT_RUN_ID"
+          else
+            # 上游是多 job 并行、整体只有一个结论：Windows job 挂了会让整次运行
+            # conclusion=failure，但同一次里已构建成功的 iOS 产物依然可用，
+            # 不该被整体丢弃。所以从最近的已完成运行里挑第一个真有产物的。
+            RUN_ID=""
+            CANDIDATES=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow publish_app_dev.yaml \
+              --limit 15 --json databaseId,conclusion \
+              --jq '.[] | select(.conclusion != null and .conclusion != "") | .databaseId' || true)
+            for RID in $CANDIDATES; do
+              N=$(artifact_count "$RID")
+              echo "候选运行 $RID：未过期产物 $N 个"
+              if [ "$N" -gt 0 ]; then
+                RUN_ID="$RID"
+                break
+              fi
+            done
+          fi
+
+          echo "run_id=${RUN_ID}" >> "$GITHUB_OUTPUT"
+          if [ -z "$RUN_ID" ]; then
+            echo "upstream_conclusion=none" >> "$GITHUB_OUTPUT"
+            echo "artifact_count=0" >> "$GITHUB_OUTPUT"
+            echo "暂无带产物的上游构建，本次跳过。"
+          else
+            CONCLUSION=$(gh run view "$RUN_ID" --repo "$GITHUB_REPOSITORY" \
+              --json conclusion --jq '.conclusion' 2>/dev/null || echo unknown)
+            COUNT=$(artifact_count "$RUN_ID")
+            echo "upstream_conclusion=${CONCLUSION}" >> "$GITHUB_OUTPUT"
+            echo "artifact_count=${COUNT}" >> "$GITHUB_OUTPUT"
+            echo "将收集运行 $RUN_ID（上游结论：$CONCLUSION，未过期产物 $COUNT 个）。"
+          fi
+
+      - name: Gate (skip when nothing to do)
+        id: gate
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if [ "${{ steps.retry.outputs.retried }}" = "true" ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "已触发自动重试，本轮不发布，等重试完成后由下一次触发接力。"
+            exit 0
+          fi
+          RUN_ID="${{ steps.run.outputs.run_id }}"
+          if [ -z "$RUN_ID" ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "没有可收集的运行，跳过发布。"
+            exit 0
+          fi
+          # 运行挑出来了但一个可用产物都没有（比如全部 job 都挂了），直接跳过而不是报错
+          if [ "${{ steps.run.outputs.artifact_count }}" = "0" ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "运行 #${RUN_ID} 没有未过期产物，跳过发布。"
+            exit 0
+          fi
+          # 幂等：nightly 正文里已记录同一个来源运行 ID 时不再重复发布
+          BODY=$(gh release view nightly --repo "$GITHUB_REPOSITORY" --json body --jq '.body' 2>/dev/null || true)
+          if echo "$BODY" | grep -qE "构建来源运行：#${RUN_ID}$"; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "nightly 已来自运行 #${RUN_ID}，跳过本次发布。"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            echo "nightly 需要更新到运行 #${RUN_ID}。"
+          fi
+
+      - name: Download upstream artifacts
+        if: steps.gate.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          # 用 gh CLI 跨运行下载，比 download-artifact 的跨运行参数更稳
+          gh run download "${{ steps.run.outputs.run_id }}" --repo "$GITHUB_REPOSITORY" -D artifacts
+
+      - name: Prepare files
+        id: files
+        if: steps.gate.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          # gh run download 会把每个产物解压到 artifacts/<产物名>/ 下，
+          # 上游产物名即平台名：android / ios / mac / linux / windows
+          find artifacts -type f \( -name '*.apk' -o -name '*.ipa' -o -name '*.zip' \
+            -o -name '*.deb' -o -name '*.dmg' -o -name '*.msix' \) -exec cp {} out/ \;
+          # 显式校验：产物为空就让流程红掉，而不是发一个空 Release
+          COUNT=$(find out -type f | wc -l)
+          echo "收集到 $COUNT 个文件："
+          ls -la out/
+          if [ "$COUNT" -eq 0 ]; then
+            echo "::error::未收集到任何构建产物，检查上游运行 ${{ steps.run.outputs.run_id }} 勾选了哪些平台"
+            exit 1
+          fi
+
+          # 用 job 级结论区分三种情况：有产物 / 勾了但构建失败 / 本次未勾选。
+          # 只看产物目录会把后两者混为一谈，而它们的处理方式完全不同。
+          JOBS_JSON=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/${{ steps.run.outputs.run_id }}/jobs?per_page=50" \
+            2>/dev/null || echo '{"jobs":[]}')
+          job_conclusion() {
+            # pipefail 下 head 提前关闭管道会让 jq 收到 SIGPIPE 而使整条管道失败，
+            # 叠加 set -e 的命令替换赋值会直接杀掉本步骤，因此这里全链路兜底。
+            local out=""
+            out=$(echo "$JOBS_JSON" | jq -r --arg n "$1" \
+              '[.jobs[]? | select(.name == $n) | .conclusion] | first // ""' 2>/dev/null) || out=""
+            printf '%s' "$out"
+          }
+
+          PRESENT=""; FAILED=""; NOTSELECTED=""
+          # 产物名 -> 上游 job 名（注意 macos 的产物名是 mac）
+          for pair in android:build-android ios:build-ios windows:build-windows linux:build-linux mac:build-macos; do
+            p="${pair%%:*}"; j="${pair##*:}"
+            c=$(job_conclusion "$j")
+            if [ -d "artifacts/$p" ] && [ -n "$(ls -A "artifacts/$p" 2>/dev/null)" ]; then
+              PRESENT="$PRESENT $p"
+            elif [ "$c" = "skipped" ]; then
+              NOTSELECTED="$NOTSELECTED $p"
+            else
+              # failure / 拿不到结论 / 成功了却没产物，都按「本次没拿到」处理
+              FAILED="$FAILED ${p}(${c:-unknown})"
+            fi
+          done
+          PRESENT=$(echo "$PRESENT" | xargs)
+          FAILED=$(echo "$FAILED" | xargs)
+          NOTSELECTED=$(echo "$NOTSELECTED" | xargs)
+
+          echo "present=${PRESENT:-无}" >> "$GITHUB_OUTPUT"
+          echo "failed=${FAILED:-无}" >> "$GITHUB_OUTPUT"
+          echo "not_selected=${NOTSELECTED:-无}" >> "$GITHUB_OUTPUT"
+          echo "本次产出：${PRESENT:-无}"
+          echo "构建失败：${FAILED:-无}"
+          echo "本次未勾选：${NOTSELECTED:-无}"
+          if [ -n "$FAILED" ]; then
+            echo "::warning::以下平台已勾选但构建失败：${FAILED}。对应 job 未产出包，本次 Release 沿用上一次的同名文件。"
+          fi
+
+      - name: Generate release body
+        id: body
+        if: steps.gate.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PRESENT: ${{ steps.files.outputs.present }}
+          FAILED: ${{ steps.files.outputs.failed }}
+          NOT_SELECTED: ${{ steps.files.outputs.not_selected }}
+          CONCLUSION: ${{ steps.run.outputs.upstream_conclusion }}
+          RUN_ID: ${{ steps.run.outputs.run_id }}
+        run: |
+          set -euo pipefail
+          # 各产物的完成时刻即该包的构建时间，换算成北京时间展示
+          ARTS_JSON=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$RUN_ID/artifacts?per_page=100" \
+            2>/dev/null || echo '{"artifacts":[]}')
+          {
+            echo "自动同步 June6699/master 后由上游 app-build-action-dev 构建。"
+            echo ""
+            echo "**各包构建时间（北京时间）**："
+            echo ""
+            echo "| 平台 | 构建完成时间 |"
+            echo "| --- | --- |"
+            for p in android ios windows linux mac; do
+              case " $PRESENT " in
+                *" $p "*) ;;
+                *) continue ;;
+              esac
+              ts=$(echo "$ARTS_JSON" | jq -r --arg n "$p" \
+                '[.artifacts[]? | select(.name == $n) | .updated_at] | first // ""' 2>/dev/null) || ts=""
+              if [ -n "$ts" ]; then
+                t=$(TZ=Asia/Shanghai date -d "$ts" '+%Y-%m-%d %H:%M' 2>/dev/null) || t=""
+                echo "| $p | ${t:-$ts} |"
+              else
+                echo "| $p | ⚠️ 时间未获取 |"
+              fi
+            done
+            echo ""
+            echo "**本次构建产出**：$PRESENT"
+            if [ "$FAILED" != "无" ]; then
+              echo ""
+              echo "**本次构建失败**：$FAILED"
+              echo ""
+              echo "> 上述平台已勾选但 job 构建失败，未产出新包；Release 中的同名文件沿用上一次的版本。"
+            fi
+            if [ "$NOT_SELECTED" != "无" ]; then
+              echo ""
+              echo "**本次未勾选**：$NOT_SELECTED"
+            fi
+            echo ""
+            echo "**上游运行结论**：$CONCLUSION"
+            if [ "$CONCLUSION" != "success" ]; then
+              echo ""
+              echo "> 上游各平台是并行 job，任一平台失败都会让整次运行标记为失败，"
+              echo "> 但同批次中构建成功的平台产物依然可用，故此处照常收集发布。"
+            fi
+            echo ""
+            echo "下方资产列表才是当前实际可下载的全部文件。iOS 为未签名 IPA，需自行重签后安装。"
+            echo ""
+            echo "构建来源运行：#${RUN_ID}"
+          } > /tmp/body.md
+          cat /tmp/body.md
+
+      - name: Clean stale nightly assets
+        if: steps.gate.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # 只清理「本次构建涉及的同类文件」，不清空整个 Release。
+          # 原因：Windows/Linux/macOS 包名带版本号，版本号一变旧包就会残留越积越多；
+          # 但只构建 iOS 时若清空全部资产，会把之前发的 Android/Windows 包一起删掉。
+          EXTS=$(find out -type f -printf '%f\n' | sed 's/.*\.//' | sort -u | tr '\n' '|' | sed 's/|$//')
+          if [ -z "$EXTS" ]; then
+            echo "本次无产物，跳过清理。"
+          elif gh release view nightly --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name' > /tmp/old_assets.txt 2>/dev/null; then
+            echo "本次涉及的扩展名：$EXTS"
+            while IFS= read -r name; do
+              [ -z "$name" ] && continue
+              if echo "$name" | grep -Eq "\.($EXTS)$"; then
+                echo "删除同类旧资产：$name"
+                gh release delete-asset nightly "$name" --repo "$GITHUB_REPOSITORY" --yes || true
+              else
+                echo "保留其他平台资产：$name"
+              fi
+            done < /tmp/old_assets.txt
+          else
+            echo "nightly Release 尚不存在，跳过清理。"
+          fi
+
+      - name: Publish/Update nightly release
+        if: steps.gate.outputs.skip != 'true'
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: nightly
+          name: Nightly Build
+          prerelease: true
+          generate_release_notes: false
+          fail_on_unmatched_files: true
+          files: |
+            out/*
+          body_path: /tmp/body.md
+
+      - name: Summary
+        if: steps.gate.outputs.skip != 'true'
+        run: |
+          echo "nightly Release 已更新，共 $(find out -type f | wc -l) 个文件。"
+          echo "本次产出：${{ steps.files.outputs.present }}"
+          echo "构建失败：${{ steps.files.outputs.failed }}"
+          echo "本次未勾选：${{ steps.files.outputs.not_selected }}"
